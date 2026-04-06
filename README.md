@@ -1,6 +1,12 @@
 # Restart Resume
 
-Re-activate idle threads after a MindRoom restart.
+[![License](https://img.shields.io/github/license/mindroom-ai/restart-resume-plugin)](https://github.com/mindroom-ai/restart-resume-plugin/blob/main/LICENSE)
+[![Docs](https://img.shields.io/badge/docs-plugins-blue)](https://docs.mindroom.chat/plugins/)
+[![Hooks](https://img.shields.io/badge/docs-hooks-blue)](https://docs.mindroom.chat/hooks/)
+
+<img src="https://raw.githubusercontent.com/mindroom-ai/mindroom/main/frontend/public/logo.png" alt="MindRoom Logo" align="right" width="120" />
+
+Re-activate idle threads after a [MindRoom](https://github.com/mindroom-ai/mindroom) restart.
 
 MindRoom already resumes in-progress work automatically — if an agent was mid-reply or had a scheduled task pending, it picks back up after restart. But sometimes a thread is idle (no pending reply, no scheduled task) and you still want the agent to continue working in it after a restart. That's what this plugin is for. Tag the thread, restart MindRoom, and the plugin sends a message to wake the agent up.
 
