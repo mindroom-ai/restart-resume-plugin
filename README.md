@@ -20,7 +20,7 @@ When MindRoom restarts, all active conversations stop mid-turn. This plugin lets
 
 ## Setup
 
-1. Copy to `~/.mindroom-chat/plugins/restart-resume`
+1. Copy to `~/.mindroom/plugins/restart-resume`
 2. Add to `config.yaml`:
    ```yaml
    plugins:
