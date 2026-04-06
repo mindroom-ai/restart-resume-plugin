@@ -1,4 +1,4 @@
-# Restart Notify
+# Restart Resume
 
 MindRoom plugin that automatically resumes interrupted agent work after a bot restart.
 
@@ -20,11 +20,11 @@ When MindRoom restarts, all active conversations stop mid-turn. This plugin lets
 
 ## Setup
 
-1. Copy to `~/.mindroom-chat/plugins/restart-notify`
+1. Copy to `~/.mindroom-chat/plugins/restart-resume`
 2. Add to `config.yaml`:
    ```yaml
    plugins:
-     - path: plugins/restart-notify
+     - path: plugins/restart-resume
    ```
 3. Restart MindRoom
 
