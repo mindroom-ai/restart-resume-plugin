@@ -14,9 +14,10 @@ if TYPE_CHECKING:
     from mindroom.hooks import AgentLifecycleContext
 
 THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
+PENDING_RESTART_TAGS = ("pending-restart", "dash-pending-restart")
 
 
-async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str, tag: str) -> int:
+async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
     """Notify pending-restart threads in one room and return the count."""
     try:
         tags_by_thread = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
@@ -29,8 +30,10 @@ async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str, tag: st
     notified = 0
     for thread_id, content in tags_by_thread.items():
         thread_tags = content.get("tags", {})
-        if tag not in thread_tags:
+        matched_tags = [tag for tag in PENDING_RESTART_TAGS if tag in thread_tags]
+        if not matched_tags:
             continue
+        tag = matched_tags[0]
 
         event_id = await ctx.send_message(
             room_id=room_id,
@@ -40,7 +43,8 @@ async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str, tag: st
         )
         if event_id:
             current_tags = dict(thread_tags)
-            current_tags.pop(tag, None)
+            for matched_tag in matched_tags:
+                current_tags.pop(matched_tag, None)
             await ctx.put_room_state(
                 room_id,
                 THREAD_TAGS_EVENT_TYPE,
@@ -66,8 +70,6 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
     except FileExistsError:
         return
 
-    tag = ctx.settings.get("tag", "pending-restart")
-
     if ctx.room_state_querier is None:
         ctx.logger.warning("No room state querier — cannot scan for pending-restart threads")
         claim_path.unlink(missing_ok=True)
@@ -76,7 +78,7 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
     try:
         notified = 0
         for room_id in ctx.joined_room_ids:
-            notified += await _notify_room_threads(ctx, room_id, tag)
+            notified += await _notify_room_threads(ctx, room_id)
         if notified:
             ctx.logger.info("Restart-notify complete", notified_count=notified)
     finally:
