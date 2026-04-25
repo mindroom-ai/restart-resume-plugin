@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from mindroom.hooks import AgentLifecycleContext
 
 THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
-PENDING_RESTART_TAGS = ("pending-restart", "dash-pending-restart")
+PENDING_RESTART_TAGS = ("pending-restart", "restart-pending")
 
 
 async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
