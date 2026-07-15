@@ -130,8 +130,8 @@ async def test_failed_state_clear_is_not_counted_as_notified() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ready_hook_scans_rooms_and_releases_claim(tmp_path: Path) -> None:
-    """Lifecycle entry point should visit all rooms and clean its claim file."""
+async def test_ready_hook_scans_rooms_and_releases_claim_lock(tmp_path: Path) -> None:
+    """Lifecycle entry point should visit all rooms and release its persistent claim lock."""
     ctx = SimpleNamespace(
         state_root=tmp_path,
         settings={},
@@ -148,7 +148,13 @@ async def test_ready_hook_scans_rooms_and_releases_claim(tmp_path: Path) -> None
         call(ctx, "!one:localhost", hooks.PENDING_RESTART_TAGS),
         call(ctx, "!two:localhost", hooks.PENDING_RESTART_TAGS),
     ]
-    assert not (tmp_path / ".restart-claim").exists()
+    claim_path = tmp_path / ".restart-claim"
+    claim_fd = os.open(str(claim_path), os.O_RDWR)
+    try:
+        fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        fcntl.flock(claim_fd, fcntl.LOCK_UN)
+        os.close(claim_fd)
     ctx.logger.info.assert_called_once_with("Restart-notify complete", notified_count=1)
 
 

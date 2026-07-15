@@ -123,7 +123,4 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
         if notified:
             ctx.logger.info("Restart-notify complete", notified_count=notified)
     finally:
-        try:
-            claim_path.unlink(missing_ok=True)
-        finally:
-            os.close(claim_fd)
+        os.close(claim_fd)
