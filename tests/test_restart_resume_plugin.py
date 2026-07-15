@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import sys
 from importlib import util
 from pathlib import Path
@@ -105,10 +107,34 @@ async def test_failed_notification_keeps_pending_tag() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_state_clear_is_not_counted_as_notified() -> None:
+    """Failed tag removal should not report a completed restart notification."""
+    ctx = SimpleNamespace(
+        query_room_state=AsyncMock(
+            return_value={"$pending": {"tags": {"pending-restart": {"set_by": "code"}}}},
+        ),
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=False),
+        logger=MagicMock(),
+    )
+
+    notified = await hooks._notify_room_threads(ctx, "!room:localhost")
+
+    assert notified == 0
+    ctx.logger.info.assert_not_called()
+    ctx.logger.warning.assert_called_once_with(
+        "Failed to clear restart tag after notification",
+        room_id="!room:localhost",
+        thread_id="$pending",
+    )
+
+
+@pytest.mark.asyncio
 async def test_ready_hook_scans_rooms_and_releases_claim(tmp_path: Path) -> None:
     """Lifecycle entry point should visit all rooms and clean its claim file."""
     ctx = SimpleNamespace(
         state_root=tmp_path,
+        settings={},
         room_state_querier=object(),
         joined_room_ids=("!one:localhost", "!two:localhost"),
         logger=MagicMock(),
@@ -119,8 +145,60 @@ async def test_ready_hook_scans_rooms_and_releases_claim(tmp_path: Path) -> None
         await hooks.notify_after_restart(ctx)
 
     assert notify.await_args_list == [
-        call(ctx, "!one:localhost"),
-        call(ctx, "!two:localhost"),
+        call(ctx, "!one:localhost", hooks.PENDING_RESTART_TAGS),
+        call(ctx, "!two:localhost", hooks.PENDING_RESTART_TAGS),
     ]
     assert not (tmp_path / ".restart-claim").exists()
     ctx.logger.info.assert_called_once_with("Restart-notify complete", notified_count=1)
+
+
+@pytest.mark.asyncio
+async def test_ready_hook_does_not_steal_held_claim(tmp_path: Path) -> None:
+    """Concurrent startup worker should leave active claim owner untouched."""
+    claim_path = tmp_path / ".restart-claim"
+    claim_fd = os.open(str(claim_path), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=("!one:localhost",),
+        logger=MagicMock(),
+    )
+    notify = AsyncMock(return_value=1)
+
+    try:
+        with patch.object(hooks, "_notify_room_threads", notify):
+            await hooks.notify_after_restart(ctx)
+        notify.assert_not_awaited()
+        assert claim_path.exists()
+    finally:
+        fcntl.flock(claim_fd, fcntl.LOCK_UN)
+        os.close(claim_fd)
+        claim_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_ready_hook_honors_configured_tag(tmp_path: Path) -> None:
+    """Configured restart tag should replace default aliases."""
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={"tag": "deploy-pending"},
+        room_state_querier=object(),
+        joined_room_ids=("!room:localhost",),
+        query_room_state=AsyncMock(
+            return_value={"$pending": {"tags": {"deploy-pending": {"set_by": "user"}}}},
+        ),
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=True),
+        logger=MagicMock(),
+    )
+
+    await hooks.notify_after_restart(ctx)
+
+    ctx.send_message.assert_awaited_once_with(
+        room_id="!room:localhost",
+        text="🔄 Restart completed — this thread's `deploy-pending` changes are now live.",
+        thread_id="$pending",
+        trigger_dispatch=True,
+    )
