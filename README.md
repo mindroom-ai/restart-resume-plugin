@@ -42,6 +42,30 @@ Plugin settings in `config.yaml`:
 
 The plugin also uses `state_root/.restart-claim` as an atomic claim file so only one startup worker processes the restart notifications.
 
+## Install
+
+Vendor this plugin with the MindRoom CLI:
+
+```bash
+mindroom plugins install restart-resume-plugin
+```
+
+Then reference it from `config.yaml`:
+
+```yaml
+plugins:
+  - path: plugins/restart-resume-plugin
+```
+
+Update to the latest commit later with:
+
+```bash
+mindroom plugins update restart-resume-plugin
+```
+
+The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
+For a manual checkout instead, see Setup below.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/restart-resume`.
