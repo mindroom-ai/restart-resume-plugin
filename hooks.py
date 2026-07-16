@@ -86,6 +86,7 @@ async def _notify_room_threads(
                     "Failed to clear restart tag after notification",
                     room_id=room_id,
                     thread_id=thread_id,
+                    reason="exception",
                     exc_info=True,
                 )
                 continue
@@ -94,6 +95,7 @@ async def _notify_room_threads(
                     "Failed to clear restart tag after notification",
                     room_id=room_id,
                     thread_id=thread_id,
+                    reason="false_result",
                 )
                 continue
             ctx.logger.info("Notified pending-restart thread", room_id=room_id, thread_id=thread_id)

@@ -126,6 +126,32 @@ async def test_failed_state_clear_is_not_counted_as_notified() -> None:
         "Failed to clear restart tag after notification",
         room_id="!room:localhost",
         thread_id="$pending",
+        reason="false_result",
+    )
+
+
+@pytest.mark.asyncio
+async def test_state_clear_exception_is_not_counted_as_notified() -> None:
+    """State-write exceptions should preserve the pending notification for retry."""
+    ctx = SimpleNamespace(
+        query_room_state=AsyncMock(
+            return_value={"$pending": {"tags": {"pending-restart": {"set_by": "code"}}}},
+        ),
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(side_effect=RuntimeError("state unavailable")),
+        logger=MagicMock(),
+    )
+
+    notified = await hooks._notify_room_threads(ctx, "!room:localhost")
+
+    assert notified == 0
+    ctx.logger.info.assert_not_called()
+    ctx.logger.warning.assert_called_once_with(
+        "Failed to clear restart tag after notification",
+        room_id="!room:localhost",
+        thread_id="$pending",
+        reason="exception",
+        exc_info=True,
     )
 
 
