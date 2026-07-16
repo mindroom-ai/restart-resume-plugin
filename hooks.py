@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,7 +18,35 @@ THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
 PENDING_RESTART_TAGS = ("pending-restart", "restart-pending")
 
 
-async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
+def _pending_restart_tags(settings: dict[str, object]) -> tuple[str, ...]:
+    """Return configured restart tag, or supported default aliases."""
+    configured_tag = settings.get("tag")
+    if isinstance(configured_tag, str) and configured_tag.strip():
+        return (configured_tag.strip(),)
+    return PENDING_RESTART_TAGS
+
+
+def _acquire_restart_claim(claim_path: Path) -> int | None:
+    """Acquire startup claim without removing another worker's claim."""
+    fd = os.open(str(claim_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+async def _notify_room_threads(
+    ctx: AgentLifecycleContext,
+    room_id: str,
+    pending_tags: tuple[str, ...] = PENDING_RESTART_TAGS,
+) -> int:
     """Notify pending-restart threads in one room and return the count."""
     try:
         tags_by_thread = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
@@ -30,7 +59,7 @@ async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
     notified = 0
     for thread_id, content in tags_by_thread.items():
         thread_tags = content.get("tags", {})
-        matched_tags = [tag for tag in PENDING_RESTART_TAGS if tag in thread_tags]
+        matched_tags = [tag for tag in pending_tags if tag in thread_tags]
         if not matched_tags:
             continue
         tag = matched_tags[0]
@@ -45,12 +74,30 @@ async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
             current_tags = dict(thread_tags)
             for matched_tag in matched_tags:
                 current_tags.pop(matched_tag, None)
-            await ctx.put_room_state(
-                room_id,
-                THREAD_TAGS_EVENT_TYPE,
-                state_key=thread_id,
-                content={"tags": current_tags},
-            )
+            try:
+                state_cleared = await ctx.put_room_state(
+                    room_id,
+                    THREAD_TAGS_EVENT_TYPE,
+                    state_key=thread_id,
+                    content={"tags": current_tags},
+                )
+            except Exception:
+                ctx.logger.warning(
+                    "Failed to clear restart tag after notification",
+                    room_id=room_id,
+                    thread_id=thread_id,
+                    reason="exception",
+                    exc_info=True,
+                )
+                continue
+            if not state_cleared:
+                ctx.logger.warning(
+                    "Failed to clear restart tag after notification",
+                    room_id=room_id,
+                    thread_id=thread_id,
+                    reason="false_result",
+                )
+                continue
             ctx.logger.info("Notified pending-restart thread", room_id=room_id, thread_id=thread_id)
             notified += 1
         else:
@@ -61,25 +108,21 @@ async def _notify_room_threads(ctx: AgentLifecycleContext, room_id: str) -> int:
 @hook(EVENT_BOT_READY, name="notify-after-restart", agents=(ROUTER_AGENT_NAME,), priority=100, timeout_ms=30000)
 async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
     """Scan rooms for pending-restart tagged threads and notify them."""
-    claim_path = Path(ctx.state_root) / ".restart-claim"
-    claim_path.unlink(missing_ok=True)
-
-    try:
-        fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-    except FileExistsError:
-        return
-
     if ctx.room_state_querier is None:
         ctx.logger.warning("No room state querier — cannot scan for pending-restart threads")
-        claim_path.unlink(missing_ok=True)
+        return
+
+    claim_path = Path(ctx.state_root) / ".restart-claim"
+    claim_fd = _acquire_restart_claim(claim_path)
+    if claim_fd is None:
         return
 
     try:
+        pending_tags = _pending_restart_tags(ctx.settings)
         notified = 0
         for room_id in ctx.joined_room_ids:
-            notified += await _notify_room_threads(ctx, room_id)
+            notified += await _notify_room_threads(ctx, room_id, pending_tags)
         if notified:
             ctx.logger.info("Restart-notify complete", notified_count=notified)
     finally:
-        claim_path.unlink(missing_ok=True)
+        os.close(claim_fd)
