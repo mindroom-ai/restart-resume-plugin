@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sys
 from importlib import util
@@ -33,6 +34,11 @@ def _load_hooks_module() -> ModuleType:
 hooks = _load_hooks_module()
 
 
+def _tag_key(thread_id: str, tag: str) -> str:
+    """Build MindRoom's per-tag thread-tag state key."""
+    return json.dumps([thread_id, tag], separators=(",", ":"))
+
+
 def test_hook_metadata_is_router_scoped() -> None:
     """Restart scan should run once through router lifecycle."""
     metadata = get_hook_metadata(hooks.notify_after_restart)
@@ -47,18 +53,14 @@ def test_hook_metadata_is_router_scoped() -> None:
 
 @pytest.mark.asyncio
 async def test_pending_thread_is_notified_and_both_aliases_are_cleared() -> None:
-    """Successful notification should preserve unrelated tags and clear restart aliases."""
+    """One notification per thread; each restart alias is tombstoned and unrelated tags are untouched."""
     ctx = SimpleNamespace(
         query_room_state=AsyncMock(
             return_value={
-                "$pending": {
-                    "tags": {
-                        "pending-restart": {"set_by": "code"},
-                        "restart-pending": {"set_by": "code"},
-                        "keep-me": {"set_by": "user"},
-                    },
-                },
-                "$untouched": {"tags": {"keep-me": {"set_by": "user"}}},
+                _tag_key("$pending", "pending-restart"): {"set_by": "code", "set_at": "2026-11-19T00:00:00Z"},
+                _tag_key("$pending", "restart-pending"): {"set_by": "code", "set_at": "2026-11-19T00:00:00Z"},
+                _tag_key("$pending", "keep-me"): {"set_by": "user", "set_at": "2026-11-19T00:00:00Z"},
+                _tag_key("$untouched", "keep-me"): {"set_by": "user", "set_at": "2026-11-19T00:00:00Z"},
             },
         ),
         send_message=AsyncMock(return_value="$restart-notice"),
@@ -75,12 +77,42 @@ async def test_pending_thread_is_notified_and_both_aliases_are_cleared() -> None
         thread_id="$pending",
         trigger_dispatch=True,
     )
-    ctx.put_room_state.assert_awaited_once_with(
-        "!room:localhost",
-        hooks.THREAD_TAGS_EVENT_TYPE,
-        state_key="$pending",
-        content={"tags": {"keep-me": {"set_by": "user"}}},
+    assert ctx.put_room_state.await_args_list == [
+        call(
+            "!room:localhost",
+            hooks.THREAD_TAGS_EVENT_TYPE,
+            state_key=_tag_key("$pending", "pending-restart"),
+            content={},
+        ),
+        call(
+            "!room:localhost",
+            hooks.THREAD_TAGS_EVENT_TYPE,
+            state_key=_tag_key("$pending", "restart-pending"),
+            content={},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tombstoned_and_legacy_tag_state_is_ignored() -> None:
+    """Removed tags (empty content) and the old per-thread format should not wake threads."""
+    ctx = SimpleNamespace(
+        query_room_state=AsyncMock(
+            return_value={
+                _tag_key("$removed", "pending-restart"): {},
+                "$legacy": {"tags": {"pending-restart": {"set_by": "code"}}},
+            },
+        ),
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=True),
+        logger=MagicMock(),
     )
+
+    notified = await hooks._notify_room_threads(ctx, "!room:localhost")
+
+    assert notified == 0
+    ctx.send_message.assert_not_awaited()
+    ctx.put_room_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -88,7 +120,7 @@ async def test_failed_notification_keeps_pending_tag() -> None:
     """Failed send should leave state intact for next restart."""
     ctx = SimpleNamespace(
         query_room_state=AsyncMock(
-            return_value={"$pending": {"tags": {"restart-pending": {"set_by": "code"}}}},
+            return_value={_tag_key("$pending", "restart-pending"): {"set_by": "code"}},
         ),
         send_message=AsyncMock(return_value=None),
         put_room_state=AsyncMock(return_value=True),
@@ -111,7 +143,7 @@ async def test_failed_state_clear_is_not_counted_as_notified() -> None:
     """Failed tag removal should not report a completed restart notification."""
     ctx = SimpleNamespace(
         query_room_state=AsyncMock(
-            return_value={"$pending": {"tags": {"pending-restart": {"set_by": "code"}}}},
+            return_value={_tag_key("$pending", "pending-restart"): {"set_by": "code"}},
         ),
         send_message=AsyncMock(return_value="$restart-notice"),
         put_room_state=AsyncMock(return_value=False),
@@ -135,7 +167,7 @@ async def test_state_clear_exception_is_not_counted_as_notified() -> None:
     """State-write exceptions should preserve the pending notification for retry."""
     ctx = SimpleNamespace(
         query_room_state=AsyncMock(
-            return_value={"$pending": {"tags": {"pending-restart": {"set_by": "code"}}}},
+            return_value={_tag_key("$pending", "pending-restart"): {"set_by": "code"}},
         ),
         send_message=AsyncMock(return_value="$restart-notice"),
         put_room_state=AsyncMock(side_effect=RuntimeError("state unavailable")),
@@ -215,11 +247,11 @@ async def test_ready_hook_honors_configured_tag(tmp_path: Path) -> None:
     """Configured restart tag should replace default aliases."""
     ctx = SimpleNamespace(
         state_root=tmp_path,
-        settings={"tag": "deploy-pending"},
+        settings={"tag": " Deploy-Pending "},
         room_state_querier=object(),
         joined_room_ids=("!room:localhost",),
         query_room_state=AsyncMock(
-            return_value={"$pending": {"tags": {"deploy-pending": {"set_by": "user"}}}},
+            return_value={_tag_key("$pending", "deploy-pending"): {"set_by": "user"}},
         ),
         send_message=AsyncMock(return_value="$restart-notice"),
         put_room_state=AsyncMock(return_value=True),
@@ -233,4 +265,10 @@ async def test_ready_hook_honors_configured_tag(tmp_path: Path) -> None:
         text="🔄 Restart completed — this thread's `deploy-pending` changes are now live.",
         thread_id="$pending",
         trigger_dispatch=True,
+    )
+    ctx.put_room_state.assert_awaited_once_with(
+        "!room:localhost",
+        hooks.THREAD_TAGS_EVENT_TYPE,
+        state_key=_tag_key("$pending", "deploy-pending"),
+        content={},
     )

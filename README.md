@@ -25,9 +25,9 @@ MindRoom already resumes in-progress work automatically when an agent was mid-re
 
 1. Tag a thread with `pending-restart`, or another configured tag name.
 2. Restart MindRoom.
-3. When the bot emits `bot:ready`, the `notify-after-restart` hook scans room state for tagged threads.
-4. Each matching thread receives a restart-complete notification that triggers agent dispatch.
-5. After a successful notification, the restart tag is removed from that thread.
+3. When the bot emits `bot:ready`, the `notify-after-restart` hook scans each room's per-tag `com.mindroom.thread.tags` state events for live restart tags.
+4. Each matching thread receives one restart-complete notification that triggers agent dispatch.
+5. After a successful notification, each matched restart tag is removed (the same empty-content tombstone MindRoom writes); other tags are untouched.
 
 ## Hooks
 

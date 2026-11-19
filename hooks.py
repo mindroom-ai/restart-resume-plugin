@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import EVENT_BOT_READY, hook
+from mindroom.thread_tags import parse_thread_tag_state_key
 
 if TYPE_CHECKING:
     from mindroom.hooks import AgentLifecycleContext
@@ -22,7 +23,7 @@ def _pending_restart_tags(settings: dict[str, object]) -> tuple[str, ...]:
     """Return configured restart tag, or supported default aliases."""
     configured_tag = settings.get("tag")
     if isinstance(configured_tag, str) and configured_tag.strip():
-        return (configured_tag.strip(),)
+        return (configured_tag.strip().lower(),)
     return PENDING_RESTART_TAGS
 
 
@@ -42,6 +43,30 @@ def _acquire_restart_claim(claim_path: Path) -> int | None:
     return fd
 
 
+async def _clear_restart_tag(ctx: AgentLifecycleContext, room_id: str, thread_id: str, state_key: str) -> bool:
+    """Write MindRoom's empty-content tombstone over one per-tag state event."""
+    try:
+        state_cleared = await ctx.put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key, content={})
+    except Exception:
+        ctx.logger.warning(
+            "Failed to clear restart tag after notification",
+            room_id=room_id,
+            thread_id=thread_id,
+            reason="exception",
+            exc_info=True,
+        )
+        return False
+    if not state_cleared:
+        ctx.logger.warning(
+            "Failed to clear restart tag after notification",
+            room_id=room_id,
+            thread_id=thread_id,
+            reason="false_result",
+        )
+        return False
+    return True
+
+
 async def _notify_room_threads(
     ctx: AgentLifecycleContext,
     room_id: str,
@@ -49,59 +74,40 @@ async def _notify_room_threads(
 ) -> int:
     """Notify pending-restart threads in one room and return the count."""
     try:
-        tags_by_thread = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+        # Each tag is its own state event keyed by json [thread_root_id, tag].
+        tag_states = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
     except Exception:
         ctx.logger.warning("Failed to query room state", room_id=room_id, exc_info=True)
         return 0
-    if not tags_by_thread:
+    if not tag_states:
         return 0
 
-    notified = 0
-    for thread_id, content in tags_by_thread.items():
-        thread_tags = content.get("tags", {})
-        matched_tags = [tag for tag in pending_tags if tag in thread_tags]
-        if not matched_tags:
+    pending_keys_by_thread: dict[str, dict[str, str]] = {}
+    for state_key, content in tag_states.items():
+        parsed_state_key = parse_thread_tag_state_key(state_key)
+        # Empty content is MindRoom's removal tombstone for this tag.
+        if parsed_state_key is None or not content:
             continue
-        tag = matched_tags[0]
+        thread_id, tag = parsed_state_key
+        if tag in pending_tags:
+            pending_keys_by_thread.setdefault(thread_id, {})[tag] = state_key
 
+    notified = 0
+    for thread_id, state_keys_by_tag in pending_keys_by_thread.items():
+        tag = next(tag for tag in pending_tags if tag in state_keys_by_tag)
         event_id = await ctx.send_message(
             room_id=room_id,
             text=f"🔄 Restart completed — this thread's `{tag}` changes are now live.",
             thread_id=thread_id,
             trigger_dispatch=True,
         )
-        if event_id:
-            current_tags = dict(thread_tags)
-            for matched_tag in matched_tags:
-                current_tags.pop(matched_tag, None)
-            try:
-                state_cleared = await ctx.put_room_state(
-                    room_id,
-                    THREAD_TAGS_EVENT_TYPE,
-                    state_key=thread_id,
-                    content={"tags": current_tags},
-                )
-            except Exception:
-                ctx.logger.warning(
-                    "Failed to clear restart tag after notification",
-                    room_id=room_id,
-                    thread_id=thread_id,
-                    reason="exception",
-                    exc_info=True,
-                )
-                continue
-            if not state_cleared:
-                ctx.logger.warning(
-                    "Failed to clear restart tag after notification",
-                    room_id=room_id,
-                    thread_id=thread_id,
-                    reason="false_result",
-                )
-                continue
+        if not event_id:
+            ctx.logger.warning("Failed to notify thread", room_id=room_id, thread_id=thread_id)
+            continue
+        cleared = [await _clear_restart_tag(ctx, room_id, thread_id, key) for key in state_keys_by_tag.values()]
+        if all(cleared):
             ctx.logger.info("Notified pending-restart thread", room_id=room_id, thread_id=thread_id)
             notified += 1
-        else:
-            ctx.logger.warning("Failed to notify thread", room_id=room_id, thread_id=thread_id)
     return notified
 
 
