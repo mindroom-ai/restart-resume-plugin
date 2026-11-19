@@ -47,6 +47,8 @@ The plugin also uses `state_root/.restart-claim` as an atomic claim file so only
 
 ## Install
 
+Requires MindRoom v2026.11.330 or newer (per-tag thread-tag state and its public parsers).
+
 Vendor this plugin with the MindRoom CLI:
 
 ```bash

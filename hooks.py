@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import EVENT_BOT_READY, hook
-from mindroom.thread_tags import parse_thread_tag_state_key
+from mindroom.thread_tags import parse_thread_tag_record, parse_thread_tag_state_key
 
 if TYPE_CHECKING:
     from mindroom.hooks import AgentLifecycleContext
@@ -50,13 +51,17 @@ async def _clear_restart_tag(
     state_key: str,
     observed: dict[str, object],
 ) -> bool:
-    """Tombstone one per-tag state event unless it changed since the scan (like MindRoom's expected_record)."""
+    """Tombstone a tag at its canonical key, as MindRoom does, unless the observed event changed since the scan."""
     try:
         current = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key)
+        if current is None:
+            ctx.logger.info("Could not re-read restart tag; keeping it", room_id=room_id, thread_id=thread_id)
+            return True
         if current != observed:
             ctx.logger.info("Restart tag changed since scan; leaving it", room_id=room_id, thread_id=thread_id)
             return True
-        state_cleared = await ctx.put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key, content={})
+        canonical_key = json.dumps(parse_thread_tag_state_key(state_key), separators=(",", ":"))
+        state_cleared = await ctx.put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=canonical_key, content={})
     except Exception:
         ctx.logger.warning(
             "Failed to clear restart tag after notification",
@@ -92,15 +97,21 @@ async def _notify_room_threads(
     if not tag_states:
         return 0
 
-    pending_by_thread: dict[str, dict[str, tuple[str, dict[str, object]]]] = {}
+    # Mirror MindRoom's room snapshot: valid records per parsed (thread, tag); any `{}` tombstone wins.
+    records: dict[tuple[str, str], tuple[str, dict[str, object]]] = {}
+    tombstones: set[tuple[str, str]] = set()
     for state_key, content in tag_states.items():
         parsed_state_key = parse_thread_tag_state_key(state_key)
-        # Empty content is MindRoom's removal tombstone for this tag.
-        if parsed_state_key is None or not content:
+        if not isinstance(content, dict) or parsed_state_key is None or parsed_state_key[1] not in pending_tags:
             continue
-        thread_id, tag = parsed_state_key
-        if tag in pending_tags:
-            pending_by_thread.setdefault(thread_id, {})[tag] = (state_key, content)
+        if not content:
+            tombstones.add(parsed_state_key)
+        elif parse_thread_tag_record(parsed_state_key[1], content) is not None:
+            records[parsed_state_key] = (state_key, content)
+    pending_by_thread: dict[str, dict[str, tuple[str, dict[str, object]]]] = {}
+    for (thread_id, tag), seen in records.items():
+        if (thread_id, tag) not in tombstones:
+            pending_by_thread.setdefault(thread_id, {})[tag] = seen
 
     notified = 0
     for thread_id, pending_by_tag in pending_by_thread.items():
