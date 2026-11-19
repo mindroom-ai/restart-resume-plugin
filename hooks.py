@@ -43,9 +43,19 @@ def _acquire_restart_claim(claim_path: Path) -> int | None:
     return fd
 
 
-async def _clear_restart_tag(ctx: AgentLifecycleContext, room_id: str, thread_id: str, state_key: str) -> bool:
-    """Write MindRoom's empty-content tombstone over one per-tag state event."""
+async def _clear_restart_tag(
+    ctx: AgentLifecycleContext,
+    room_id: str,
+    thread_id: str,
+    state_key: str,
+    observed: dict[str, object],
+) -> bool:
+    """Tombstone one per-tag state event unless it changed since the scan (like MindRoom's expected_record)."""
     try:
+        current = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key)
+        if current != observed:
+            ctx.logger.info("Restart tag changed since scan; leaving it", room_id=room_id, thread_id=thread_id)
+            return True
         state_cleared = await ctx.put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key, content={})
     except Exception:
         ctx.logger.warning(
@@ -82,7 +92,7 @@ async def _notify_room_threads(
     if not tag_states:
         return 0
 
-    pending_keys_by_thread: dict[str, dict[str, str]] = {}
+    pending_by_thread: dict[str, dict[str, tuple[str, dict[str, object]]]] = {}
     for state_key, content in tag_states.items():
         parsed_state_key = parse_thread_tag_state_key(state_key)
         # Empty content is MindRoom's removal tombstone for this tag.
@@ -90,11 +100,11 @@ async def _notify_room_threads(
             continue
         thread_id, tag = parsed_state_key
         if tag in pending_tags:
-            pending_keys_by_thread.setdefault(thread_id, {})[tag] = state_key
+            pending_by_thread.setdefault(thread_id, {})[tag] = (state_key, content)
 
     notified = 0
-    for thread_id, state_keys_by_tag in pending_keys_by_thread.items():
-        tag = next(tag for tag in pending_tags if tag in state_keys_by_tag)
+    for thread_id, pending_by_tag in pending_by_thread.items():
+        tag = next(tag for tag in pending_tags if tag in pending_by_tag)
         event_id = await ctx.send_message(
             room_id=room_id,
             text=f"🔄 Restart completed — this thread's `{tag}` changes are now live.",
@@ -104,7 +114,7 @@ async def _notify_room_threads(
         if not event_id:
             ctx.logger.warning("Failed to notify thread", room_id=room_id, thread_id=thread_id)
             continue
-        cleared = [await _clear_restart_tag(ctx, room_id, thread_id, key) for key in state_keys_by_tag.values()]
+        cleared = [await _clear_restart_tag(ctx, room_id, thread_id, *seen) for seen in pending_by_tag.values()]
         if all(cleared):
             ctx.logger.info("Notified pending-restart thread", room_id=room_id, thread_id=thread_id)
             notified += 1
