@@ -179,13 +179,39 @@ async def test_non_canonical_key_record_is_tombstoned_at_canonical_key() -> None
     )
 
     assert await hooks._notify_room_threads(ctx, "!room:localhost") == 1
-    ctx.query_room_state.assert_awaited_with("!room:localhost", hooks.THREAD_TAGS_EVENT_TYPE, state_key=spaced_key)
+    ctx.query_room_state.assert_awaited_with(
+        "!room:localhost",
+        hooks.THREAD_TAGS_EVENT_TYPE,
+        state_key=_tag_key("$pending", "pending-restart"),
+    )
     ctx.put_room_state.assert_awaited_once_with(
         "!room:localhost",
         hooks.THREAD_TAGS_EVENT_TYPE,
         state_key=_tag_key("$pending", "pending-restart"),
         content={},
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_canonical_re_tag_is_not_erased_by_noncanonical_cleanup() -> None:
+    """A re-tag MindRoom writes at the canonical key after a noncanonical scan must survive the clear."""
+    scanned = {json.dumps(["$pending", "pending-restart"]): _RECORD}
+    fresh = {"set_by": "agent", "set_at": "2026-11-19T00:05:00Z"}
+
+    async def query(_room_id: str, _event_type: str, state_key: str | None = None) -> object:
+        if state_key is None:
+            return scanned
+        return fresh if state_key == _tag_key("$pending", "pending-restart") else _RECORD
+
+    ctx = SimpleNamespace(
+        query_room_state=AsyncMock(side_effect=query),
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=True),
+        logger=MagicMock(),
+    )
+
+    assert await hooks._notify_room_threads(ctx, "!room:localhost") == 1
+    ctx.put_room_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -51,16 +51,17 @@ async def _clear_restart_tag(
     state_key: str,
     observed: dict[str, object],
 ) -> bool:
-    """Tombstone a tag at its canonical key, as MindRoom does, unless the observed event changed since the scan."""
+    """Tombstone a tag at its canonical key, as MindRoom does, unless that key changed since the scan."""
     try:
-        current = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=state_key)
-        if current is None:
-            ctx.logger.info("Could not re-read restart tag; keeping it", room_id=room_id, thread_id=thread_id)
-            return True
-        if current != observed:
-            ctx.logger.info("Restart tag changed since scan; leaving it", room_id=room_id, thread_id=thread_id)
-            return True
         canonical_key = json.dumps(parse_thread_tag_state_key(state_key), separators=(",", ":"))
+        current = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=canonical_key)
+        # An empty/missing canonical key is expected when the scanned record lives under a noncanonical spelling.
+        if current != observed and (current or state_key == canonical_key):
+            if current is None:
+                ctx.logger.info("Could not re-read restart tag; keeping it", room_id=room_id, thread_id=thread_id)
+            else:
+                ctx.logger.info("Restart tag changed since scan; leaving it", room_id=room_id, thread_id=thread_id)
+            return True
         state_cleared = await ctx.put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key=canonical_key, content={})
     except Exception:
         ctx.logger.warning(
