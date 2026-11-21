@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
@@ -14,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import EVENT_BOT_READY
 from mindroom.hooks.decorators import get_hook_metadata
 
@@ -51,16 +51,17 @@ def _room_state(states: dict[str, dict[str, object]]) -> AsyncMock:
     return AsyncMock(side_effect=query)
 
 
-def test_hook_metadata_is_router_scoped() -> None:
-    """Restart scan should run once through router lifecycle."""
+def test_hook_metadata_is_service_scoped() -> None:
+    """Restart scan should run once at service startup."""
     metadata = get_hook_metadata(hooks.notify_after_restart)
 
     assert metadata is not None
     assert metadata.event_name == EVENT_BOT_READY
     assert metadata.hook_name == "notify-after-restart"
-    assert metadata.agents == (ROUTER_AGENT_NAME,)
+    assert metadata.scope == "service"
+    assert metadata.agents is None
     assert metadata.priority == 100
-    assert metadata.timeout_ms == 30000
+    assert metadata.timeout_ms == 300_000
 
 
 @pytest.mark.asyncio
@@ -348,8 +349,8 @@ async def test_ready_hook_scans_rooms_and_releases_claim_lock(tmp_path: Path) ->
         await hooks.notify_after_restart(ctx)
 
     assert notify.await_args_list == [
-        call(ctx, "!one:localhost", hooks.PENDING_RESTART_TAGS),
-        call(ctx, "!two:localhost", hooks.PENDING_RESTART_TAGS),
+        call(ctx, "!one:localhost", hooks.PENDING_RESTART_TAGS, timeout_seconds=10),
+        call(ctx, "!two:localhost", hooks.PENDING_RESTART_TAGS, timeout_seconds=10),
     ]
     claim_path = tmp_path / ".restart-claim"
     claim_fd = os.open(str(claim_path), os.O_RDWR)
@@ -359,6 +360,163 @@ async def test_ready_hook_scans_rooms_and_releases_claim_lock(tmp_path: Path) ->
         fcntl.flock(claim_fd, fcntl.LOCK_UN)
         os.close(claim_fd)
     ctx.logger.info.assert_called_once_with("Restart-notify complete", notified_count=1)
+
+
+@pytest.mark.asyncio
+async def test_slow_room_does_not_block_later_restart_notices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled full-state read expires, and later rooms still get their notices."""
+    monkeypatch.setattr(hooks, "_ROOM_TIMEOUT_SECONDS", 0.05)
+    slow_room = "!slow:localhost"
+    fast_rooms = tuple(f"!fast{i}:localhost" for i in range(5))
+    monkeypatch.setattr(hooks, "_ROOM_RETRY_TIMEOUT_SECONDS", 0.1)
+    stalled_reads_closed = 0
+    key = _tag_key("$pending", "pending-restart")
+
+    async def query(room_id: str, _event_type: str, state_key: str | None = None) -> object:
+        nonlocal stalled_reads_closed
+        if room_id == slow_room:
+            try:
+                await asyncio.Future()
+            finally:
+                stalled_reads_closed += 1
+        return {key: _RECORD} if state_key is None else _RECORD
+
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=(slow_room, *fast_rooms),
+        query_room_state=query,
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=True),
+        logger=MagicMock(),
+    )
+
+    async with asyncio.timeout(1):
+        await hooks.notify_after_restart(ctx)
+
+    assert stalled_reads_closed == 2
+    assert sorted(notice.kwargs["room_id"] for notice in ctx.send_message.await_args_list) == list(fast_rooms)
+    assert sorted(clear.args[0] for clear in ctx.put_room_state.await_args_list) == list(fast_rooms)
+
+
+@pytest.mark.asyncio
+async def test_timed_out_discovery_is_retried_last_with_a_longer_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hooks, "_ROOM_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(hooks, "_ROOM_RETRY_TIMEOUT_SECONDS", 0.3)
+    slow = "!slow:localhost"
+    fast_rooms = [f"!fast{i}:localhost" for i in range(5)]
+    reads: list[str] = []
+    key = _tag_key("$pending", "pending-restart")
+
+    async def query(room_id: str, _event_type: str, state_key: str | None = None) -> object:
+        if state_key is not None:
+            return _RECORD
+        reads.append(room_id)
+        if room_id == slow:
+            if reads.count(slow) == 1:
+                await asyncio.Future()
+            await asyncio.sleep(0.06)  # Too slow for the initial deadline, fast enough for the retry.
+        return {key: _RECORD}
+
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=(slow, *fast_rooms),
+        query_room_state=query,
+        send_message=AsyncMock(return_value="$restart-notice"),
+        put_room_state=AsyncMock(return_value=True),
+        logger=MagicMock(),
+    )
+    async with asyncio.timeout(1):
+        await hooks.notify_after_restart(ctx)
+
+    assert reads == [slow, *fast_rooms, slow]
+    assert [notice.kwargs["room_id"] for notice in ctx.send_message.await_args_list] == [*fast_rooms, slow]
+    assert ctx.put_room_state.await_count == 6
+
+
+@pytest.mark.asyncio
+async def test_discovery_deadline_does_not_interrupt_cleanup_after_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Let the old per-room deadline expire during cleanup, then scan again without duplicate notices."""
+    monkeypatch.setattr(hooks, "_ROOM_TIMEOUT_SECONDS", 0.05)
+    threads = ["$first", "$second", "$third"]
+    first_key = _tag_key("$first", "pending-restart")
+    states = {_tag_key(thread, "pending-restart"): _RECORD for thread in threads}
+    notices: list[str] = []
+    stall_first_clear = True
+
+    async def query(_room_id: str, _event_type: str, state_key: str | None = None) -> object:
+        return dict(states) if state_key is None else states.get(state_key)
+
+    async def send(*, thread_id: str, **_kwargs: object) -> str:
+        notices.append(thread_id)
+        return "$restart-notice"
+
+    async def clear(_room_id: str, _event_type: str, *, state_key: str, content: dict[str, object]) -> bool:
+        nonlocal stall_first_clear
+        if state_key == first_key and stall_first_clear:
+            stall_first_clear = False
+            await asyncio.sleep(0.1)
+        states[state_key] = content
+        return True
+
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=("!room:localhost",),
+        query_room_state=query,
+        send_message=send,
+        put_room_state=clear,
+        logger=MagicMock(),
+    )
+    async with asyncio.timeout(1):
+        await hooks.notify_after_restart(ctx)
+        first_pass = notices.copy()
+        await hooks.notify_after_restart(ctx)
+
+    assert notices == threads
+    assert first_pass == threads
+    assert all(content == {} for content in states.values())
+
+
+@pytest.mark.asyncio
+async def test_ready_hook_bounds_parallel_room_reads(tmp_path: Path) -> None:
+    """At startup several state reads can overlap, but not every room at once."""
+    rooms = tuple(f"!room{i}:localhost" for i in range(8))
+    completed = []
+    active = peak = 0
+
+    async def query(room_id: str, _event_type: str) -> dict[str, object]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        completed.append(room_id)
+        return {}
+
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=rooms,
+        query_room_state=query,
+        logger=MagicMock(),
+    )
+
+    await hooks.notify_after_restart(ctx)
+
+    assert sorted(completed) == list(rooms)
+    assert 1 < peak <= 3
 
 
 @pytest.mark.asyncio

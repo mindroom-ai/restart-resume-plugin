@@ -15,7 +15,10 @@ MindRoom already resumes in-progress work automatically when an agent was mid-re
 
 ## Features
 
-- Scans all rooms on `bot:ready` for threads tagged for restart follow-up
+- Runs once at service `bot:ready` and scans every room a MindRoom bot has joined
+- Scans up to three rooms at a time, allowing 10 seconds for each room's initial state read
+- Retries only timed-out reads once after the first pass, allowing 60 seconds per retry within the same five-minute cap
+- Sends notices and clears tags outside the room read deadline, with a five-minute cap for the whole hook
 - Sends a wake-up message with `trigger_dispatch=True` so the agent continues working
 - Removes the restart tag after successful notification
 - Uses a configurable tag name instead of hard-coding `pending-restart`
@@ -25,7 +28,7 @@ MindRoom already resumes in-progress work automatically when an agent was mid-re
 
 1. Tag a thread with `pending-restart`, or another configured tag name.
 2. Restart MindRoom.
-3. When the bot emits `bot:ready`, the `notify-after-restart` hook scans each room's per-tag `com.mindroom.thread.tags` state events for live restart tags.
+3. When the service emits `bot:ready`, the `notify-after-restart` hook scans each room's per-tag `com.mindroom.thread.tags` state events for live restart tags.
 4. Each matching thread receives one restart-complete notification that triggers agent dispatch.
 5. After a successful notification, each matched restart tag is removed (the same empty-content tombstone MindRoom writes); other tags are untouched.
 
@@ -33,7 +36,7 @@ MindRoom already resumes in-progress work automatically when an agent was mid-re
 
 | Hook | Event | Purpose |
 |------|-------|---------|
-| `notify-after-restart` | `bot:ready` | Scan for tagged threads, wake them, and clear the restart tag |
+| `notify-after-restart` | `bot:ready` (service) | Scan for tagged threads, wake them, and clear the restart tag |
 
 ## Configuration
 
@@ -47,7 +50,7 @@ The plugin also uses `state_root/.restart-claim` as an atomic claim file so only
 
 ## Install
 
-Requires MindRoom v2026.11.330 or newer (per-tag thread-tag state and its public parsers).
+Requires MindRoom v2026.11.491 or newer (plugin API 1.33).
 
 Vendor this plugin with the MindRoom CLI:
 
