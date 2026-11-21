@@ -16,7 +16,8 @@ MindRoom already resumes in-progress work automatically when an agent was mid-re
 ## Features
 
 - Runs once at service `bot:ready` and scans every room a MindRoom bot has joined
-- Scans up to three rooms at a time, giving each room up to 10 seconds with a five-minute cap for the whole scan
+- Scans up to three rooms at a time, allowing 10 seconds for each room’s initial state read
+- Sends notices and clears tags outside the room read deadline, with a five-minute cap for the whole hook
 - Sends a wake-up message with `trigger_dispatch=True` so the agent continues working
 - Removes the restart tag after successful notification
 - Uses a configurable tag name instead of hard-coding `pending-restart`

@@ -92,8 +92,12 @@ async def _notify_room_threads(
 ) -> int:
     """Notify pending-restart threads in one room and return the count."""
     try:
-        # Each tag is its own state event keyed by json [thread_root_id, tag].
-        tag_states = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+        # Time out only discovery; don't interrupt a notice or its tag cleanup mid-room.
+        async with asyncio.timeout(_ROOM_TIMEOUT_SECONDS):
+            tag_states = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+    except TimeoutError:
+        ctx.logger.warning("Restart notice discovery timed out for room", room_id=room_id)
+        return 0
     except Exception:
         ctx.logger.warning("Failed to query room state", room_id=room_id, exc_info=True)
         return 0
@@ -156,10 +160,7 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
             notified = 0
             for room_id in room_ids:
                 try:
-                    async with asyncio.timeout(_ROOM_TIMEOUT_SECONDS):
-                        notified += await _notify_room_threads(ctx, room_id, pending_tags)
-                except TimeoutError:
-                    ctx.logger.warning("Restart notice scan timed out for room", room_id=room_id)
+                    notified += await _notify_room_threads(ctx, room_id, pending_tags)
                 except Exception:
                     ctx.logger.warning("Failed to process restart notices for room", room_id=room_id, exc_info=True)
             return notified

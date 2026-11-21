@@ -61,6 +61,7 @@ def test_hook_metadata_is_service_scoped() -> None:
     assert metadata.scope == "service"
     assert metadata.agents is None
     assert metadata.priority == 100
+    assert metadata.timeout_ms == 300_000
 
 
 @pytest.mark.asyncio
@@ -395,6 +396,54 @@ async def test_slow_room_does_not_block_later_restart_notices(tmp_path: Path, mo
     assert stalled_read_closed.is_set()
     assert sorted(notice.kwargs["room_id"] for notice in ctx.send_message.await_args_list) == list(fast_rooms)
     assert sorted(clear.args[0] for clear in ctx.put_room_state.await_args_list) == list(fast_rooms)
+
+
+@pytest.mark.asyncio
+async def test_discovery_deadline_does_not_interrupt_cleanup_after_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Let the old per-room deadline expire during cleanup, then scan again without duplicate notices."""
+    monkeypatch.setattr(hooks, "_ROOM_TIMEOUT_SECONDS", 0.05)
+    threads = ["$first", "$second", "$third"]
+    first_key = _tag_key("$first", "pending-restart")
+    states = {_tag_key(thread, "pending-restart"): _RECORD for thread in threads}
+    notices: list[str] = []
+    stall_first_clear = True
+
+    async def query(_room_id: str, _event_type: str, state_key: str | None = None) -> object:
+        return dict(states) if state_key is None else states.get(state_key)
+
+    async def send(*, thread_id: str, **_kwargs: object) -> str:
+        notices.append(thread_id)
+        return "$restart-notice"
+
+    async def clear(_room_id: str, _event_type: str, *, state_key: str, content: dict[str, object]) -> bool:
+        nonlocal stall_first_clear
+        if state_key == first_key and stall_first_clear:
+            stall_first_clear = False
+            await asyncio.sleep(0.1)
+        states[state_key] = content
+        return True
+
+    ctx = SimpleNamespace(
+        state_root=tmp_path,
+        settings={},
+        room_state_querier=object(),
+        joined_room_ids=("!room:localhost",),
+        query_room_state=query,
+        send_message=send,
+        put_room_state=clear,
+        logger=MagicMock(),
+    )
+    async with asyncio.timeout(1):
+        await hooks.notify_after_restart(ctx)
+        first_pass = notices.copy()
+        await hooks.notify_after_restart(ctx)
+
+    assert notices == threads
+    assert first_pass == threads
+    assert all(content == {} for content in states.values())
 
 
 @pytest.mark.asyncio
