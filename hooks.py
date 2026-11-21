@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import EVENT_BOT_READY, hook
 from mindroom.thread_tags import parse_thread_tag_record, parse_thread_tag_state_key
 
@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
 PENDING_RESTART_TAGS = ("pending-restart", "restart-pending")
+_ROOM_WORKERS = 3
+_ROOM_TIMEOUT_SECONDS = 10
 
 
 def _pending_restart_tags(settings: dict[str, object]) -> tuple[str, ...]:
@@ -133,7 +135,7 @@ async def _notify_room_threads(
     return notified
 
 
-@hook(EVENT_BOT_READY, name="notify-after-restart", agents=(ROUTER_AGENT_NAME,), priority=100, timeout_ms=30000)
+@hook(EVENT_BOT_READY, name="notify-after-restart", scope="service", priority=100, timeout_ms=300_000)
 async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
     """Scan rooms for pending-restart tagged threads and notify them."""
     if ctx.room_state_querier is None:
@@ -147,9 +149,24 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
 
     try:
         pending_tags = _pending_restart_tags(ctx.settings)
-        notified = 0
-        for room_id in ctx.joined_room_ids:
-            notified += await _notify_room_threads(ctx, room_id, pending_tags)
+        # Share one iterator so each worker takes the next room as soon as it is free.
+        room_ids = iter(ctx.joined_room_ids)
+
+        async def scan_rooms() -> int:
+            notified = 0
+            for room_id in room_ids:
+                try:
+                    async with asyncio.timeout(_ROOM_TIMEOUT_SECONDS):
+                        notified += await _notify_room_threads(ctx, room_id, pending_tags)
+                except TimeoutError:
+                    ctx.logger.warning("Restart notice scan timed out for room", room_id=room_id)
+                except Exception:
+                    ctx.logger.warning("Failed to process restart notices for room", room_id=room_id, exc_info=True)
+            return notified
+
+        async with asyncio.TaskGroup() as group:
+            scans = [group.create_task(scan_rooms()) for _ in range(min(_ROOM_WORKERS, len(ctx.joined_room_ids)))]
+        notified = sum(scan.result() for scan in scans)
         if notified:
             ctx.logger.info("Restart-notify complete", notified_count=notified)
     finally:
