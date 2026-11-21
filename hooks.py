@@ -20,6 +20,7 @@ THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
 PENDING_RESTART_TAGS = ("pending-restart", "restart-pending")
 _ROOM_WORKERS = 3
 _ROOM_TIMEOUT_SECONDS = 10
+_ROOM_RETRY_TIMEOUT_SECONDS = 60
 
 
 def _pending_restart_tags(settings: dict[str, object]) -> tuple[str, ...]:
@@ -89,15 +90,19 @@ async def _notify_room_threads(
     ctx: AgentLifecycleContext,
     room_id: str,
     pending_tags: tuple[str, ...] = PENDING_RESTART_TAGS,
-) -> int:
-    """Notify pending-restart threads in one room and return the count."""
+    *,
+    timeout_seconds: float = _ROOM_TIMEOUT_SECONDS,
+) -> int | None:
+    """Return the count of notified threads, or None if the initial read times out."""
     try:
         # Time out only discovery; don't interrupt a notice or its tag cleanup mid-room.
-        async with asyncio.timeout(_ROOM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(timeout_seconds):
             tag_states = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
     except TimeoutError:
-        ctx.logger.warning("Restart notice discovery timed out for room", room_id=room_id)
-        return 0
+        ctx.logger.warning(
+            "Restart notice discovery timed out for room", room_id=room_id, timeout_seconds=timeout_seconds
+        )
+        return None
     except Exception:
         ctx.logger.warning("Failed to query room state", room_id=room_id, exc_info=True)
         return 0
@@ -153,21 +158,34 @@ async def notify_after_restart(ctx: AgentLifecycleContext) -> None:
 
     try:
         pending_tags = _pending_restart_tags(ctx.settings)
-        # Share one iterator so each worker takes the next room as soon as it is free.
-        room_ids = iter(ctx.joined_room_ids)
 
-        async def scan_rooms() -> int:
-            notified = 0
-            for room_id in room_ids:
-                try:
-                    notified += await _notify_room_threads(ctx, room_id, pending_tags)
-                except Exception:
-                    ctx.logger.warning("Failed to process restart notices for room", room_id=room_id, exc_info=True)
-            return notified
+        async def scan_pass(rooms: tuple[str, ...], timeout_seconds: float) -> tuple[int, tuple[str, ...]]:
+            # Share one iterator so each worker takes the next room as soon as it is free.
+            room_ids = iter(rooms)
+            timed_out: list[str] = []
 
-        async with asyncio.TaskGroup() as group:
-            scans = [group.create_task(scan_rooms()) for _ in range(min(_ROOM_WORKERS, len(ctx.joined_room_ids)))]
-        notified = sum(scan.result() for scan in scans)
+            async def scan_rooms() -> int:
+                notified = 0
+                for room_id in room_ids:
+                    try:
+                        count = await _notify_room_threads(ctx, room_id, pending_tags, timeout_seconds=timeout_seconds)
+                    except Exception:
+                        ctx.logger.warning("Failed to process restart notices for room", room_id=room_id, exc_info=True)
+                        continue
+                    if count is None:
+                        timed_out.append(room_id)
+                    else:
+                        notified += count
+                return notified
+
+            async with asyncio.TaskGroup() as group:
+                scans = [group.create_task(scan_rooms()) for _ in range(min(_ROOM_WORKERS, len(rooms)))]
+            return sum(scan.result() for scan in scans), tuple(timed_out)
+
+        notified, timed_out = await scan_pass(ctx.joined_room_ids, _ROOM_TIMEOUT_SECONDS)
+        if timed_out:
+            retried, _ = await scan_pass(timed_out, _ROOM_RETRY_TIMEOUT_SECONDS)
+            notified += retried
         if notified:
             ctx.logger.info("Restart-notify complete", notified_count=notified)
     finally:
