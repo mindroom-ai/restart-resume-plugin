@@ -10,11 +10,11 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mindroom.hooks import EVENT_BOT_READY, hook
+from mindroom.plugin_api import EVENT_BOT_READY, hook
 from mindroom.thread_tags import parse_thread_tag_record, parse_thread_tag_state_key
 
 if TYPE_CHECKING:
-    from mindroom.hooks import AgentLifecycleContext
+    from mindroom.plugin_api import AgentLifecycleContext
 
 THREAD_TAGS_EVENT_TYPE = "com.mindroom.thread.tags"
 PENDING_RESTART_TAGS = ("pending-restart", "restart-pending")

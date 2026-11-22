@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from mindroom.hooks import EVENT_BOT_READY
 from mindroom.hooks.decorators import get_hook_metadata
+from mindroom.plugin_api import EVENT_BOT_READY
 
 
 def _load_hooks_module() -> ModuleType:
