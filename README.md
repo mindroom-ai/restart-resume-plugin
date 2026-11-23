@@ -21,7 +21,7 @@ MindRoom already resumes active or interrupted turns natively. Use this plugin f
 - **Tag before restarting:** mark any idle thread with `pending-restart` (or `restart-pending`, or a custom tag).
 - **Wakes automatically on startup:** once MindRoom is ready, each matching thread gets one wake-up message that triggers agent dispatch.
 - **Cleans up after itself:** matched restart tags are cleared after the message is sent; other thread tags stay untouched.
-- **No duplicate notices:** a startup lock prevents multiple workers from notifying the same thread twice.
+- **Coordinated startup:** a startup lock prevents duplicate notices across concurrent startup workers (if clearing the tag fails after sending, a later restart may notify the thread again).
 
 ## Quick start
 
