@@ -1,6 +1,7 @@
 # Restart Resume
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/mindroom-ai/restart-resume-plugin/actions/workflows/plugin-ci.yml/badge.svg)](https://github.com/mindroom-ai/restart-resume-plugin/actions/workflows/plugin-ci.yml)
 [![Docs](https://img.shields.io/badge/docs-plugins-blue)](https://docs.mindroom.chat/plugins/)
 [![Hooks](https://img.shields.io/badge/docs-hooks-blue)](https://docs.mindroom.chat/hooks/)
 
@@ -9,79 +10,60 @@
   <img src="https://raw.githubusercontent.com/mindroom-ai/mindroom/main/assets/logo/logo-mark.svg" alt="MindRoom Logo" align="right" width="120" />
 </picture>
 
-Re-activate idle threads after a [MindRoom](https://github.com/mindroom-ai/mindroom) restart.
+A [MindRoom](https://github.com/mindroom-ai/mindroom) hook plugin that resumes idle threads tagged before a restart once the bot comes back online.
 
-MindRoom already resumes in-progress work automatically when an agent was mid-reply or had a scheduled task pending. This plugin handles the other case: threads that are idle, but that you still want to resume after the next restart. Tag the thread before restarting, and the plugin will wake it once the bot comes back up.
+MindRoom already resumes active or interrupted turns natively. Use this plugin for idle threads—for example, work waiting on a config change or deploy—so the agent picks them back up automatically after the next restart:
 
-## Features
+```text
+🔄 Restart completed — this thread's `pending-restart` changes are now live.
+```
 
-- Runs once at service `bot:ready` and scans every room a MindRoom bot has joined
-- Scans up to three rooms at a time, allowing 10 seconds for each room's initial state read
-- Retries only timed-out reads once after the first pass, allowing 60 seconds per retry within the same five-minute cap
-- Sends notices and clears tags outside the room read deadline, with a five-minute cap for the whole hook
-- Sends a wake-up message with `trigger_dispatch=True` so the agent continues working
-- Removes the restart tag after successful notification
-- Uses a configurable tag name instead of hard-coding `pending-restart`
-- Uses an atomic claim file to avoid duplicate notifications when multiple workers start at once
+- **Tag before restarting:** mark any idle thread with `pending-restart` (or `restart-pending`, or a custom tag).
+- **Wakes automatically on startup:** once MindRoom is ready, each matching thread gets one wake-up message that triggers agent dispatch.
+- **Cleans up after itself:** matched restart tags are cleared after the message is sent; other thread tags stay untouched.
+- **Coordinated startup:** a startup lock prevents duplicate notices across concurrent startup workers (if clearing the tag fails after sending, a later restart may notify the thread again).
 
-## How It Works
-
-1. Tag a thread with `pending-restart`, or another configured tag name.
-2. Restart MindRoom.
-3. When the service emits `bot:ready`, the `notify-after-restart` hook scans each room's per-tag `com.mindroom.thread.tags` state events for live restart tags.
-4. Each matching thread receives one restart-complete notification that triggers agent dispatch.
-5. After a successful notification, each matched restart tag is removed (the same empty-content tombstone MindRoom writes); other tags are untouched.
-
-## Hooks
-
-| Hook | Event | Purpose |
-|------|-------|---------|
-| `notify-after-restart` | `bot:ready` (service) | Scan for tagged threads, wake them, and clear the restart tag |
-
-## Configuration
-
-Plugin settings in `config.yaml`:
-
-| Setting | Required | Description |
-|---------|----------|-------------|
-| `tag` | No | Thread tag to scan for on restart. Defaults to `pending-restart` |
-
-The plugin also uses `state_root/.restart-claim` as an atomic claim file so only one startup worker processes the restart notifications.
-
-## Install
-
-Requires MindRoom v2026.11.491 or newer (plugin API 1.33).
-
-Vendor this plugin with the MindRoom CLI:
+## Quick start
 
 ```bash
 mindroom plugins install restart-resume-plugin
 ```
 
-Then reference it from `config.yaml`:
-
 ```yaml
 plugins:
   - path: plugins/restart-resume-plugin
+    # settings:
+    #   tag: pending-restart  # optional; replaces both default tags
 ```
 
-Update to the latest commit later with:
+Update later with `mindroom plugins update restart-resume-plugin`.
+Needs MindRoom v2026.11.491 or later (plugin API 1.33).
 
-```bash
-mindroom plugins update restart-resume-plugin
-```
+## Settings
 
-The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
-For a manual checkout instead, see Setup below.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `tag` | `pending-restart`, `restart-pending` | Thread tag to watch on restart. Omitting `tag` matches **both** `pending-restart` and `restart-pending` (and clears both on a matching thread). Setting `tag` replaces both defaults with that single stripped, lowercased tag. |
 
-## Setup
+<details>
+<summary><b>How it works</b></summary>
 
-1. Copy this plugin to `~/.mindroom/plugins/restart-resume`.
-2. Add the plugin to `config.yaml`:
-   ```yaml
-   plugins:
-     - path: plugins/restart-resume
-   ```
-3. Restart MindRoom.
+1. At service startup (`bot:ready`), `notify-after-restart` acquires a non-blocking exclusive POSIX `fcntl.flock` lock on `state_root/.restart-claim` (skipping quietly if another worker already holds it).
+2. It scans joined rooms up to 3 at a time (`asyncio.TaskGroup`) for `com.mindroom.thread.tags` state events, allowing 10 seconds per room for the initial read and retrying timed-out rooms once with a 60-second read timeout—all within the hook's 5-minute (`300_000` ms) overall cap.
+3. Sending notices (`trigger_dispatch=True`) and clearing tags run outside the per-room read deadline so an in-progress room isn't cut short.
+4. Empty-content (`{}`) tombstones win over live records, and legacy per-thread tag records are ignored. Each thread with one or more live restart tags receives one wake-up message.
+5. After the message is sent, each matched restart tag is re-read at its canonical state key; if unchanged since the scan, it is removed with an empty `{}` tombstone (matching MindRoom's own tag removal), leaving other tags and concurrently updated restart tags untouched.
 
-No agent tools are required. This plugin is hooks-only.
+Notes:
+
+- **Manifest name:** `mindroom.plugin.json` registers the plugin name as `restart-notify` (hooks-only; no agent tools required).
+- **Internal helper import:** `hooks.py` imports `parse_thread_tag_record` and `parse_thread_tag_state_key` from `mindroom.thread_tags` (outside the stable `mindroom.plugin_api` surface), so `mindroom plugins check` warns about it; re-run `mindroom plugins check` after MindRoom upgrades.
+- **Manual install:** instead of `mindroom plugins install`, clone this repository into `plugins/restart-resume-plugin` next to your `config.yaml` and reference `path: plugins/restart-resume-plugin`.
+
+</details>
+
+## Hooks
+
+| Hook | Event | Purpose |
+|------|-------|---------|
+| `notify-after-restart` | `bot:ready` (service) | Scan joined rooms for tagged threads, send one wake-up message per thread, and clear matched restart tags |
